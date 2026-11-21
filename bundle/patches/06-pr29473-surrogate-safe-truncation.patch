@@ -1,0 +1,147 @@
+diff --git a/mastracode/sdk/src/utils/__tests__/token-estimator.test.ts b/mastracode/sdk/src/utils/__tests__/token-estimator.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..a6769f0f51dadea06348cc98872e4e1183e4cdd4
+--- /dev/null
++++ b/mastracode/sdk/src/utils/__tests__/token-estimator.test.ts
+@@ -0,0 +1,44 @@
++import { describe, expect, it } from 'vitest';
++
++import { truncateStringForTokenEstimate } from '../token-estimator.js';
++
++// Matches a high surrogate not followed by a low one, or a low surrogate not preceded by a high one.
++const LONE_SURROGATE_RE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
++
++function expectWellFormed(text: string) {
++  expect(text).not.toMatch(LONE_SURROGATE_RE);
++  // Node escapes a lone surrogate as `\udXXX`, which strict JSON parsers reject.
++  expect(JSON.stringify(text)).not.toMatch(/\\ud[89a-f][0-9a-f]{2}/i);
++}
++
++describe('truncateStringForTokenEstimate', () => {
++  // A web_search result held math italic letters (surrogate pairs). The truncated result started
++  // with the low half of U+1D452, and the provider rejected the request:
++  // "The request body is not valid JSON: lone leading surrogate in hex escape".
++  it('does not split a surrogate pair at the cut (math italic text)', () => {
++    const text = 'plain prefix text\n𝑡ℎ𝑟𝑒𝑠ℎ𝑜𝑙𝑑𝑗';
++
++    // Before the fix this returned "\udc52𝑠ℎ𝑜𝑙𝑑𝑗" after the marker.
++    const truncated = truncateStringForTokenEstimate(text, 2);
++
++    expect(truncated).toMatch(/^\[Truncated ~\d+ tokens\]\n�𝑠ℎ𝑜𝑙𝑑𝑗$/u);
++    expectWellFormed(truncated);
++  });
++
++  it('does not leave half an emoji at either end of the cut', () => {
++    const text = `release notes ${'🙂'.repeat(5)} and more words after the emoji run`;
++
++    for (let tokens = 1; tokens < 20; tokens++) {
++      expectWellFormed(truncateStringForTokenEstimate(text, tokens));
++      expectWellFormed(truncateStringForTokenEstimate(text, tokens, false));
++    }
++  });
++
++  it('keeps whole surrogate pairs that the cut does not touch', () => {
++    const text = `${'word '.repeat(50)}🙂 end`;
++
++    const truncated = truncateStringForTokenEstimate(text, 3);
++
++    expect(truncated).toContain('🙂 end');
++  });
++});
+diff --git a/mastracode/sdk/src/utils/token-estimator.ts b/mastracode/sdk/src/utils/token-estimator.ts
+index aa9fa088378dde0815df6d083df15f411facc162..7cd7e8eaba0756d4d208334ad543e00407681bab 100644
+--- a/mastracode/sdk/src/utils/token-estimator.ts
++++ b/mastracode/sdk/src/utils/token-estimator.ts
+@@ -1,5 +1,8 @@
+ import { estimateTokenCount, sliceByTokens } from 'tokenx';
+ 
++// Unicode mode matches lone surrogate code points without matching complete pairs.
++const UNPAIRED_SURROGATE_RE = /[\uD800-\uDFFF]/gu;
++
+ function sanitizeInput(text: string | object) {
+   if (!text) return '';
+   return (typeof text === `string` ? text : JSON.stringify(text))
+@@ -17,7 +20,11 @@ export function truncateStringForTokenEstimate(text: string, desiredTokenCount:
+ 
+   if (totalTokens <= desiredTokenCount) return sanitized;
+ 
+-  const kept = fromEnd ? sliceByTokens(sanitized, -desiredTokenCount) : sliceByTokens(sanitized, 0, desiredTokenCount);
++  // tokenx cuts on UTF-16 code units, so a cut can split a surrogate pair (emoji, math letters).
++  // The lone half makes the provider request invalid JSON, so replace it with U+FFFD.
++  const kept = (
++    fromEnd ? sliceByTokens(sanitized, -desiredTokenCount) : sliceByTokens(sanitized, 0, desiredTokenCount)
++  ).replace(UNPAIRED_SURROGATE_RE, '�');
+ 
+   return `[Truncated ~${totalTokens - desiredTokenCount} tokens]
+ ${kept}`;
+diff --git a/packages/core/src/utils/slice-by-tokens.ts b/packages/core/src/utils/slice-by-tokens.ts
+index fdbe6c982e04b443f3f73a85544b20bda72bc597..1c987736441caf903d36faabfacb3207f8ec77cf 100644
+--- a/packages/core/src/utils/slice-by-tokens.ts
++++ b/packages/core/src/utils/slice-by-tokens.ts
+@@ -13,3 +13,8 @@ const UNPAIRED_SURROGATE_RE = /[\uD800-\uDFFF]/gu;
+ export function sliceByTokensSafe(text: string, start: number, end?: number): string {
+   return sliceByTokens(text, start, end).replace(UNPAIRED_SURROGATE_RE, '\uFFFD');
+ }
++
++/** `text.slice(start, end)` by UTF-16 index, with the same repair for a cut inside a surrogate pair. */
++export function sliceSafe(text: string, start?: number, end?: number): string {
++  return text.slice(start, end).replace(UNPAIRED_SURROGATE_RE, '\uFFFD');
++}
+diff --git a/packages/core/src/workspace/tools/__tests__/grep.test.ts b/packages/core/src/workspace/tools/__tests__/grep.test.ts
+index c9e2ca4909c549e68ca0c9d1f18b73ce448af762..d36c0c7a9025ac501a2cf106dae7b1bdea91e15b 100644
+--- a/packages/core/src/workspace/tools/__tests__/grep.test.ts
++++ b/packages/core/src/workspace/tools/__tests__/grep.test.ts
+@@ -653,6 +653,24 @@ describe('workspace_grep', () => {
+     expect(result).toContain('(truncated at 1000)');
+   });
+ 
++  it('does not split a surrogate pair when it cuts a long matching line', async () => {
++    // 499 ASCII chars then an emoji: the 500-char cut lands between its two UTF-16 halves.
++    await fs.writeFile(path.join(tempDir, 'long.txt'), `${'x'.repeat(499)}🙂 needle\nshort needle`);
++    const workspace = new Workspace({ filesystem: new LocalFilesystem({ basePath: tempDir }) });
++    const tools = await createWorkspaceTools(workspace);
++    const loneSurrogate = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
++
++    for (const contextLines of [0, 1]) {
++      const result = (await tools[WORKSPACE_TOOLS.FILESYSTEM.GREP].execute(
++        { pattern: 'needle', contextLines },
++        { workspace },
++      )) as string;
++
++      expect(result).toContain(`${'x'.repeat(499)}\uFFFD...`);
++      expect(result).not.toMatch(loneSurrogate);
++    }
++  });
++
+   it('should apply token limit to output', async () => {
+     // Create a file with many lines that will exceed default token limit (~3k tokens)
+     // Each line has ~5 words => ~7 tokens. 1000 lines => ~7000 tokens (well over 3k)
+diff --git a/packages/core/src/workspace/tools/grep.ts b/packages/core/src/workspace/tools/grep.ts
+index 6da2b067768f716e026a4d7aafe47922e2bd4135..2162e6ce7086f5bf69ece1b13aa383bcc2128555 100644
+--- a/packages/core/src/workspace/tools/grep.ts
++++ b/packages/core/src/workspace/tools/grep.ts
+@@ -1,5 +1,6 @@
+ import { z } from 'zod/v4';
+ import { createTool } from '../../tools';
++import { sliceSafe } from '../../utils/slice-by-tokens';
+ import { WORKSPACE_TOOLS } from '../constants';
+ import { UnsupportedGrepPatternError } from '../errors';
+ import type { FilesystemGrepResult } from '../filesystem';
+@@ -379,7 +380,7 @@ Usage:
+                 if (columnIndex !== undefined) {
+                   let lineContent = line;
+                   if (lineContent.length > MAX_LINE_LENGTH) {
+-                    lineContent = lineContent.slice(0, MAX_LINE_LENGTH) + '...';
++                    lineContent = sliceSafe(lineContent, 0, MAX_LINE_LENGTH) + '...';
+                   }
+                   outputLines.push(`${filePath}:${i + 1}:${columnIndex + 1}: ${lineContent}`);
+                 } else {
+@@ -391,7 +392,7 @@ Usage:
+             for (const match of fileMatches) {
+               let lineContent = getLine(match.lineIndex) ?? '';
+               if (lineContent.length > MAX_LINE_LENGTH) {
+-                lineContent = lineContent.slice(0, MAX_LINE_LENGTH) + '...';
++                lineContent = sliceSafe(lineContent, 0, MAX_LINE_LENGTH) + '...';
+               }
+               outputLines.push(`${filePath}:${match.lineIndex + 1}:${match.columnIndex + 1}: ${lineContent}`);
+             }

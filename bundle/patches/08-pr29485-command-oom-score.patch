@@ -1,0 +1,272 @@
+diff --git a/packages/core/src/workspace/sandbox/local-process-manager-oom-score.test.ts b/packages/core/src/workspace/sandbox/local-process-manager-oom-score.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..8100ef861ebe608e6ded4ac809cf1677fa49ca48
+--- /dev/null
++++ b/packages/core/src/workspace/sandbox/local-process-manager-oom-score.test.ts
+@@ -0,0 +1,77 @@
++import { existsSync, readFileSync } from 'node:fs';
++import { mkdtemp, rm } from 'node:fs/promises';
++import { tmpdir } from 'node:os';
++import { join } from 'node:path';
++import { afterEach, describe, expect, it, vi } from 'vitest';
++
++import { executeCommandTool } from '../tools/execute-command';
++import { Workspace } from '../workspace';
++import { LocalSandbox } from './local-sandbox';
++
++// Real processes: the command's own /proc/self/oom_score_adj shows what the kernel OOM killer
++// would use for it. The kill itself needs a memory-limited cgroup and is checked outside unit tests.
++const ownAdj = (() => {
++  try {
++    return Number.parseInt(readFileSync('/proc/self/oom_score_adj', 'utf8'), 10);
++  } catch {
++    return undefined;
++  }
++})();
++const canRaise = process.platform === 'linux' && existsSync('/proc/self/oom_score_adj') && ownAdj! < 500;
++
++describe.skipIf(!canRaise)('LocalSandbox commands get a raised OOM score', () => {
++  const directories: string[] = [];
++  const sandboxes: LocalSandbox[] = [];
++
++  async function makeSandbox() {
++    const directory = await mkdtemp(join(tmpdir(), 'mastra-oom-'));
++    directories.push(directory);
++    const sandbox = new LocalSandbox({ workingDirectory: directory, isolation: 'none' });
++    sandboxes.push(sandbox);
++    return sandbox;
++  }
++
++  afterEach(async () => {
++    vi.unstubAllEnvs();
++    await Promise.all(sandboxes.splice(0).map(sandbox => sandbox._destroy().catch(() => {})));
++    await Promise.all(directories.splice(0).map(directory => rm(directory, { recursive: true, force: true })));
++  });
++
++  it('runs foreground commands at 500, with output and exit code unchanged', async () => {
++    const sandbox = await makeSandbox();
++    const result = await sandbox.executeCommand('cat /proc/self/oom_score_adj; printf err >&2; exit 7');
++    expect(result.stdout).toBe('500\n');
++    expect(result.stderr).toBe('err');
++    expect(result.exitCode).toBe(7);
++  });
++
++  it('runs background processes at 500', async () => {
++    const sandbox = await makeSandbox();
++    const handle = await sandbox.processes.spawn('sh -c "cat /proc/self/oom_score_adj"');
++    const result = await handle.wait();
++    expect(result.stdout).toBe('500\n');
++    expect(result.exitCode).toBe(0);
++  });
++
++  it('leaves the agent at its own score', async () => {
++    const sandbox = await makeSandbox();
++    await sandbox.executeCommand('true');
++    expect(Number.parseInt(readFileSync('/proc/self/oom_score_adj', 'utf8'), 10)).toBe(ownAdj);
++  });
++
++  it('runs commands at the agent score when turned off', async () => {
++    vi.stubEnv('MASTRA_COMMAND_OOM_SCORE_ADJ', '0');
++    const sandbox = await makeSandbox();
++    const result = await sandbox.executeCommand('cat /proc/self/oom_score_adj');
++    expect(result.stdout).toBe(`${ownAdj}\n`);
++  });
++
++  it('reaches every stage of a pipeline run by execute_command', async () => {
++    const sandbox = await makeSandbox();
++    const result = await executeCommandTool.execute!(
++      { command: 'cat /proc/self/oom_score_adj | tail -1', tail: 0, timeout: 10 },
++      { workspace: new Workspace({ sandbox }) },
++    );
++    expect(result).toBe('500\n');
++  });
++});
+diff --git a/packages/core/src/workspace/sandbox/local-process-manager.test.ts b/packages/core/src/workspace/sandbox/local-process-manager.test.ts
+index 77287761fc664447925e6b65a551515c6e3cf824..a9fd42b3d3f212e1ba8940356455a8e27926f8a3 100644
+--- a/packages/core/src/workspace/sandbox/local-process-manager.test.ts
++++ b/packages/core/src/workspace/sandbox/local-process-manager.test.ts
+@@ -2,12 +2,25 @@ import { EventEmitter } from 'node:events';
+ import { PassThrough } from 'node:stream';
+ import { afterEach, describe, expect, it, vi } from 'vitest';
+ 
+-const { execa, existsSync } = vi.hoisted(() => ({ execa: vi.fn(), existsSync: vi.fn((_path: string) => false) }));
+-vi.mock('./execa', () => ({ getExeca: async () => execa }));
+-vi.mock('node:fs', async importOriginal => ({
+-  ...(await importOriginal<typeof import('node:fs')>()),
+-  existsSync: (p: string) => existsSync(p),
++const { execa, existsSync, ownOomScoreAdj } = vi.hoisted(() => ({
++  execa: vi.fn(),
++  existsSync: vi.fn((_path: string) => false),
++  // The agent's own /proc/self/oom_score_adj. Undefined: the file does not exist.
++  ownOomScoreAdj: { value: undefined as string | undefined },
+ }));
++vi.mock('./execa', () => ({ getExeca: async () => execa }));
++vi.mock('node:fs', async importOriginal => {
++  const actual = await importOriginal<typeof import('node:fs')>();
++  return {
++    ...actual,
++    existsSync: (p: string) => existsSync(p),
++    readFileSync: ((file: any, ...rest: any[]) => {
++      if (file !== '/proc/self/oom_score_adj') return (actual.readFileSync as any)(file, ...rest);
++      if (ownOomScoreAdj.value === undefined) throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
++      return ownOomScoreAdj.value;
++    }) as typeof actual.readFileSync,
++  };
++});
+ 
+ afterEach(() => {
+   vi.restoreAllMocks();
+@@ -16,6 +29,7 @@ afterEach(() => {
+   execa.mockReset();
+   existsSync.mockReset();
+   existsSync.mockReturnValue(false);
++  ownOomScoreAdj.value = undefined;
+ });
+ 
+ describe('LocalProcessManager Windows argv boundary', () => {
+@@ -323,3 +337,72 @@ describe('LocalProcessManager stdin wiring', () => {
+     sandbox.processes.release(handle.pid);
+   });
+ });
++
++describe('LocalProcessManager OOM score for spawned commands', () => {
++  const raise = (value: number) => `{ echo ${value} >/proc/self/oom_score_adj; } 2>/dev/null; `;
++
++  async function spawnOn(platform: NodeJS.Platform, isolation: 'none' | 'bwrap' = 'none') {
++    vi.spyOn(process, 'platform', 'get').mockReturnValue(platform);
++    const nativeSandbox = await import('./native-sandbox');
++    vi.spyOn(nativeSandbox, 'isIsolationAvailable').mockReturnValue(true);
++    const { LocalSandbox } = await import('./local-sandbox');
++    const sandbox = new LocalSandbox({ workingDirectory: process.cwd(), isolation });
++    vi.spyOn(sandbox, 'ensureRunning').mockResolvedValue();
++    const wrap = vi.spyOn(sandbox, 'wrapCommandForIsolation');
++    if (isolation !== 'none') wrap.mockImplementation(command => ({ command: 'bwrap', args: ['sh', '-c', command] }));
++    const subprocess = Object.assign(new EventEmitter(), {
++      pid: 12345,
++      stdout: new PassThrough(),
++      stderr: new PassThrough(),
++      catch: vi.fn(),
++    });
++    execa.mockReturnValue(subprocess);
++    const handle = await sandbox.processes.spawn('python3 train.py | tail -5');
++    subprocess.emit('close', 0, null);
++    await handle.wait();
++    sandbox.processes.release(handle.pid);
++    return { handle, wrap, execaCall: execa.mock.calls[0]! };
++  }
++
++  it('raises the shell oom_score_adj before the command on Linux', async () => {
++    ownOomScoreAdj.value = '0\n';
++    const { handle, execaCall } = await spawnOn('linux');
++    expect(execaCall[0]).toBe(`${raise(500)}python3 train.py | tail -5`);
++    expect(execaCall[2]).toMatchObject({ shell: true });
++    // Process listings keep the command as the caller wrote it.
++    expect(handle.command).toBe('python3 train.py | tail -5');
++  });
++
++  it('raises it inside the isolation wrapper', async () => {
++    ownOomScoreAdj.value = '0\n';
++    const { wrap, execaCall } = await spawnOn('linux', 'bwrap');
++    expect(wrap).toHaveBeenCalledWith(`${raise(500)}python3 train.py | tail -5`);
++    expect(execaCall[1]).toEqual(['sh', '-c', `${raise(500)}python3 train.py | tail -5`]);
++  });
++
++  it.each([
++    ['800', 800],
++    ['1500', 1000],
++    ['not-a-number', 500],
++  ])('takes the value from MASTRA_COMMAND_OOM_SCORE_ADJ=%s', async (configured, expected) => {
++    vi.stubEnv('MASTRA_COMMAND_OOM_SCORE_ADJ', configured);
++    ownOomScoreAdj.value = '0\n';
++    const { execaCall } = await spawnOn('linux');
++    expect(execaCall[0]).toBe(`${raise(expected)}python3 train.py | tail -5`);
++  });
++
++  it.each([
++    { name: 'turned off with 0', platform: 'linux', own: '0\n', configured: '0' },
++    { name: 'turned off with off', platform: 'linux', own: '0\n', configured: 'off' },
++    { name: 'the agent is already at the target', platform: 'linux', own: '500\n', configured: undefined },
++    { name: 'the agent is above the target', platform: 'linux', own: '900\n', configured: undefined },
++    { name: 'there is no /proc/self/oom_score_adj', platform: 'linux', own: undefined, configured: undefined },
++    { name: 'on macOS', platform: 'darwin', own: '0\n', configured: undefined },
++    { name: 'on Windows', platform: 'win32', own: '0\n', configured: undefined },
++  ] as const)('leaves the command unchanged when $name', async ({ platform, own, configured }) => {
++    if (configured !== undefined) vi.stubEnv('MASTRA_COMMAND_OOM_SCORE_ADJ', configured);
++    ownOomScoreAdj.value = own;
++    const { execaCall } = await spawnOn(platform);
++    expect(execaCall[0]).toBe('python3 train.py | tail -5');
++  });
++});
+diff --git a/packages/core/src/workspace/sandbox/local-process-manager.ts b/packages/core/src/workspace/sandbox/local-process-manager.ts
+index e76266c98388a7b499ac931f49266518074e08f6..1a9857f2d1f4fcfc17b31ed4bf570e0668d2b156 100644
+--- a/packages/core/src/workspace/sandbox/local-process-manager.ts
++++ b/packages/core/src/workspace/sandbox/local-process-manager.ts
+@@ -5,7 +5,7 @@
+  * Tracks processes in-memory since there's no server to query.
+  */
+ 
+-import { existsSync } from 'node:fs';
++import { existsSync, readFileSync } from 'node:fs';
+ import * as path from 'node:path';
+ 
+ import type { ResultPromise, Options as ExecaOptions } from 'execa';
+@@ -26,6 +26,50 @@ const TIMEOUT_KILL_GRACE_MS = 2_000;
+ /** How long output may keep draining after the process exits before wait() settles without it. */
+ const EXIT_OUTPUT_GRACE_MS = 2_000;
+ 
++const OOM_SCORE_ADJ_PATH = '/proc/self/oom_score_adj';
++
++/** `oom_score_adj` given to spawned commands unless `MASTRA_COMMAND_OOM_SCORE_ADJ` overrides it. */
++const DEFAULT_COMMAND_OOM_SCORE_ADJ = 500;
++
++/**
++ * The `oom_score_adj` to give spawned commands: `MASTRA_COMMAND_OOM_SCORE_ADJ` (1-1000), or the
++ * default when it is unset or not a number. `0`, `off` or `false` turns the adjustment off.
++ */
++function commandOomScoreAdj(): number | undefined {
++  const configured = process.env.MASTRA_COMMAND_OOM_SCORE_ADJ?.trim();
++  if (configured && /^(0+|off|false)$/i.test(configured)) return undefined;
++  if (configured && /^\d+$/.test(configured)) return Math.min(Number(configured), 1000);
++  return DEFAULT_COMMAND_OOM_SCORE_ADJ;
++}
++
++/**
++ * Prefix a shell command so that its shell raises its own `oom_score_adj` first (Linux only).
++ *
++ * The agent and the commands it runs share one memory limit in a container. When a command's
++ * processes use it all up, the kernel OOM killer kills the process with the highest score, and a
++ * Node agent holding a few hundred MB often outscores each of many smaller workers. Everything the
++ * shell starts inherits the raised score (also across `exec`), so the kernel kills the workload
++ * instead, and the agent sees `Killed` / exit 137 in the command result.
++ *
++ * Raising your own score needs no privilege. A failed write (no `/proc`, read-only `/proc`) is
++ * silent, and the prefix changes neither the command's output nor its exit status. It stays on
++ * the command's first line, so shell error line numbers are unchanged. It is skipped when the
++ * agent's own score is already at or above the target, since lowering a score needs privilege.
++ */
++function withRaisedOomScore(command: string): string {
++  if (process.platform !== 'linux') return command;
++  const target = commandOomScoreAdj();
++  if (target === undefined) return command;
++  let current: number;
++  try {
++    current = Number.parseInt(readFileSync(OOM_SCORE_ADJ_PATH, 'utf8'), 10);
++  } catch {
++    return command;
++  }
++  if (!(current < target)) return command;
++  return `{ echo ${target} >${OOM_SCORE_ADJ_PATH}; } 2>/dev/null; ${command}`;
++}
++
+ /**
+  * Find a POSIX shell on Windows for commands built with POSIX quoting.
+  * Checks `MASTRA_WINDOWS_SHELL`, then Git Bash next to a `git.exe` on the command's PATH
+@@ -351,7 +395,7 @@ export class LocalProcessManager extends SandboxProcessManager<LocalSandbox> {
+       : usesBash && invocation
+         ? // Quote the program too: bash reads the backslashes in C:\tools\node.exe as escapes.
+           { command: [invocation.command, ...invocation.args].map(shellQuote).join(' '), args: [] }
+-        : this.sandbox.wrapCommandForIsolation(command);
++        : this.sandbox.wrapCommandForIsolation(withRaisedOomScore(command));
+ 
+     // Base options shared across all platforms.
+     //

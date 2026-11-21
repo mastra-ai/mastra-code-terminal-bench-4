@@ -1,0 +1,233 @@
+diff --git a/mastracode/sdk/src/agents/fastembed-subprocess.test.ts b/mastracode/sdk/src/agents/fastembed-subprocess.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..06319e2b6bf5186983dfb5578588ec51c2f028a9
+--- /dev/null
++++ b/mastracode/sdk/src/agents/fastembed-subprocess.test.ts
+@@ -0,0 +1,56 @@
++import { mkdtempSync, writeFileSync } from 'node:fs';
++import { tmpdir } from 'node:os';
++import { join } from 'node:path';
++import { pathToFileURL } from 'node:url';
++import { describe, expect, it } from 'vitest';
++
++import { embedInSubprocess } from './fastembed-subprocess.js';
++
++// Stand-ins for @mastra/fastembed: the worker imports whatever entry it is given.
++function fixture(body: string): string {
++  const file = join(mkdtempSync(join(tmpdir(), 'fastembed-subprocess-')), 'fastembed.mjs');
++  writeFileSync(file, `export const fastembed = { small: { async doEmbed({ values }) { ${body} } } };\n`);
++  return pathToFileURL(file).href;
++}
++
++describe('embedInSubprocess', () => {
++  it('embeds in a child process and returns its vectors', async () => {
++    const entry = fixture(
++      'return { embeddings: values.map(v => [v.length, process.pid]), warnings: [{ type: "other", message: "w" }] };',
++    );
++    const result = await embedInSubprocess({ values: ['ab', 'abcd'] }, entry);
++    expect(result.embeddings.map(e => e[0])).toEqual([2, 4]);
++    expect(result.embeddings[0]![1]).not.toBe(process.pid);
++    expect(result.warnings).toEqual([{ type: 'other', message: 'w' }]);
++  });
++
++  it('rejects with the worker error', async () => {
++    const entry = fixture('throw new Error("model missing");');
++    await expect(embedInSubprocess({ values: ['x'] }, entry)).rejects.toThrow('model missing');
++  });
++
++  it('rejects when the worker is killed, as the OOM killer would', async () => {
++    const entry = fixture('process.kill(process.pid, "SIGKILL");');
++    await expect(embedInSubprocess({ values: ['x'] }, entry)).rejects.toThrow(/signal SIGKILL/);
++  });
++
++  it('runs one worker at a time', async () => {
++    const entry = fixture(
++      'const t0 = Date.now(); await new Promise(r => setTimeout(r, 200)); return { embeddings: [[t0, Date.now()]], warnings: [] };',
++    );
++    const [a, b] = await Promise.all([
++      embedInSubprocess({ values: ['a'] }, entry),
++      embedInSubprocess({ values: ['b'] }, entry),
++    ]);
++    const [[aStart, aEnd], [bStart]] = [a.embeddings[0]!, b.embeddings[0]!];
++    expect(bStart! >= aEnd! || aStart! >= b.embeddings[0]![1]!).toBe(true);
++  });
++
++  it('kills the worker on abort', async () => {
++    const entry = fixture('await new Promise(r => setTimeout(r, 30_000)); return { embeddings: [[1]], warnings: [] };');
++    const controller = new AbortController();
++    const pending = embedInSubprocess({ values: ['x'], abortSignal: controller.signal }, entry);
++    setTimeout(() => controller.abort(new Error('stop')), 300);
++    await expect(pending).rejects.toThrow('stop');
++  });
++});
+diff --git a/mastracode/sdk/src/agents/fastembed-subprocess.ts b/mastracode/sdk/src/agents/fastembed-subprocess.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..3cbcb3e96c9a4d3124ebbc99afbdc799e89bbe22
+--- /dev/null
++++ b/mastracode/sdk/src/agents/fastembed-subprocess.ts
+@@ -0,0 +1,80 @@
++import { spawn } from 'node:child_process';
++import type { fastembed } from '@mastra/fastembed';
++
++type FastembedModel = typeof fastembed.small;
++type DoEmbedOptions = Parameters<FastembedModel['doEmbed']>[0];
++type DoEmbedResult = Awaited<ReturnType<FastembedModel['doEmbed']>>;
++type WorkerReply = { embeddings?: number[][]; warnings?: DoEmbedResult['warnings']; error?: string };
++
++/**
++ * Run with `node -e`. Loads `@mastra/fastembed` from the given entry, embeds once, replies over IPC and
++ * exits, so ONNX Runtime's session and memory arena leave with the process. It raises its own OOM score
++ * first: if a small sandbox runs out of memory mid-embedding, the kernel kills this worker, not the agent.
++ */
++const WORKER_SOURCE = `
++try { require('node:fs').writeFileSync('/proc/self/oom_score_adj', '500'); } catch {}
++process.once('message', async ({ entry, values }) => {
++  try {
++    const mod = await import(entry);
++    const { embeddings, warnings } = await (mod.fastembed ?? mod.default.fastembed).small.doEmbed({ values });
++    process.send({ embeddings, warnings }, () => process.exit(0));
++  } catch (error) {
++    process.send({ error: String((error && error.stack) || error) }, () => process.exit(1));
++  }
++});
++`;
++
++let queue: Promise<unknown> = Promise.resolve();
++
++/**
++ * Embeds with `fastembed.small` in a short-lived child process, one call at a time.
++ *
++ * In-process, the bge-small session costs ~230 MB of RSS that stays for the rest of the run (plus ~33 MB
++ * of arena per extra text in a batch, also kept). In a 4 GB sandbox that makes the agent the largest
++ * process, which is the one the kernel OOM killer picks. Observational memory embeds a few times per run,
++ * so the ~0.3 s model load per call is cheap.
++ */
++export function embedInSubprocess(
++  options: DoEmbedOptions,
++  entry: string = import.meta.resolve('@mastra/fastembed'),
++): Promise<DoEmbedResult> {
++  const run = () => runWorker(entry, options);
++  const result = queue.then(run, run);
++  queue = result.catch(() => {});
++  return result;
++}
++
++function runWorker(entry: string, { values, abortSignal }: DoEmbedOptions): Promise<DoEmbedResult> {
++  return new Promise((resolve, reject) => {
++    if (abortSignal?.aborted) {
++      reject(abortSignal.reason);
++      return;
++    }
++    const child = spawn(process.execPath, ['-e', WORKER_SOURCE], {
++      stdio: ['ignore', 'ignore', 'inherit', 'ipc'],
++      env: process.env,
++    });
++    let reply: WorkerReply | undefined;
++    const onAbort = () => child.kill('SIGKILL');
++    abortSignal?.addEventListener('abort', onAbort, { once: true });
++    child.on('message', message => {
++      reply = message as WorkerReply;
++    });
++    child.once('error', error => {
++      abortSignal?.removeEventListener('abort', onAbort);
++      reject(error);
++    });
++    // 'close' follows the IPC channel closing, so a reply sent before exit has arrived by then.
++    child.once('close', (code, signal) => {
++      abortSignal?.removeEventListener('abort', onAbort);
++      if (reply?.embeddings) {
++        resolve({ embeddings: reply.embeddings, warnings: reply.warnings ?? [] });
++      } else if (abortSignal?.aborted) {
++        reject(abortSignal.reason);
++      } else {
++        reject(new Error(reply?.error ?? `fastembed worker exited without a result (code ${code}, signal ${signal})`));
++      }
++    });
++    child.send({ entry, values });
++  });
++}
+diff --git a/mastracode/sdk/src/agents/memory.test.ts b/mastracode/sdk/src/agents/memory.test.ts
+index 02ed70cbde40b2064e01ab80813aafb7cf7e039b..b8a032eb75ade918edb0747d87a226607c38ffc0 100644
+--- a/mastracode/sdk/src/agents/memory.test.ts
++++ b/mastracode/sdk/src/agents/memory.test.ts
+@@ -8,6 +8,8 @@ const memorySettledMock = vi.fn(async (): Promise<void> => {});
+ const getOmScopeMock = vi.fn();
+ const resolveModelMock = vi.fn();
+ const loadSettingsMock = vi.fn();
++const embedInSubprocessMock = vi.fn();
++const fastembedDoEmbedMock = vi.fn();
+ 
+ vi.mock('@mastra/memory', async () => ({
+   resolveAutoModelId: (await vi.importActual<typeof import('@mastra/memory')>('@mastra/memory')).resolveAutoModelId,
+@@ -26,7 +28,11 @@ vi.mock('@mastra/memory', async () => ({
+ }));
+ 
+ vi.mock('@mastra/fastembed', () => ({
+-  fastembed: { small: 'fastembed-small' },
++  fastembed: { small: { doEmbed: fastembedDoEmbedMock } },
++}));
++
++vi.mock('./fastembed-subprocess.js', () => ({
++  embedInSubprocess: embedInSubprocessMock,
+ }));
+ 
+ vi.mock('../utils/project.js', () => ({
+@@ -160,6 +166,24 @@ describe('getDynamicMemory', () => {
+     vi.stubEnv('GOOGLE_GENERATIVE_AI_API_KEY', '');
+   });
+ 
++  it('embeds observations in a worker process unless MASTRACODE_EMBED_IN_PROCESS=1', async () => {
++    embedInSubprocessMock.mockReset().mockResolvedValue({ embeddings: [[1]], warnings: [] });
++    fastembedDoEmbedMock.mockReset().mockResolvedValue({ embeddings: [[2]], warnings: [] });
++    const { config } = await createMemoryConfig({ projectPath: '/tmp/project' }, 'thread', { vector: true });
++    const embedder = config.embedder as { doEmbed: (options: { values: string[] }) => Promise<unknown> };
++
++    // Default: the worker embeds, so fastembed never loads into this process.
++    await expect(embedder.doEmbed({ values: ['a'] })).resolves.toEqual({ embeddings: [[1]], warnings: [] });
++    expect(embedInSubprocessMock).toHaveBeenCalledWith({ values: ['a'] });
++    expect(fastembedDoEmbedMock).not.toHaveBeenCalled();
++
++    // Opt-out: fastembed runs in this process, and no worker starts.
++    vi.stubEnv('MASTRACODE_EMBED_IN_PROCESS', '1');
++    await expect(embedder.doEmbed({ values: ['b'] })).resolves.toEqual({ embeddings: [[2]], warnings: [] });
++    expect(fastembedDoEmbedMock).toHaveBeenCalledWith({ values: ['b'] });
++    expect(embedInSubprocessMock).toHaveBeenCalledTimes(1);
++  });
++
+   it('wires Mastra Code observational memory activation defaults into core memory', async () => {
+     const { config, requestContext } = await createMemoryConfig({ projectPath: '/tmp/project' });
+ 
+diff --git a/mastracode/sdk/src/agents/memory.ts b/mastracode/sdk/src/agents/memory.ts
+index 5bc6870980b7e31c6c85ae9357fc9b0df609cfc4..818c36c6a572e41edcb3f9d5056654e51ad5a484 100644
+--- a/mastracode/sdk/src/agents/memory.ts
++++ b/mastracode/sdk/src/agents/memory.ts
+@@ -11,11 +11,13 @@ import { loadSettings } from '../onboarding/settings.js';
+ import { ANTHROPIC_PROMPT_CACHE_TTL } from '../providers/anthropic-prompt-cache.js';
+ import type { MastraCodeState } from '../schema.js';
+ import { getOmScope } from '../utils/project.js';
++import { embedInSubprocess } from './fastembed-subprocess.js';
+ import { canUseProvider, getActiveMemoryRoute, resolveModel } from './model.js';
+ 
+ /**
+- * `fastembed.small`, loaded on the first embedding. Importing `@mastra/fastembed` up front loads ONNX
+- * Runtime and a native tokenizer (~11 MB) into every session, including ones that never embed.
++ * `fastembed.small`, run in a short-lived child process per call (see `embedInSubprocess`) so ONNX
++ * Runtime never loads into the agent process. `MASTRACODE_EMBED_IN_PROCESS=1` loads it here instead, on
++ * the first embedding.
+  */
+ const lazyFastembedSmall: typeof fastembed.small = {
+   specificationVersion: 'v3',
+@@ -24,8 +26,11 @@ const lazyFastembedSmall: typeof fastembed.small = {
+   maxEmbeddingsPerCall: 256,
+   supportsParallelCalls: true,
+   async doEmbed(options) {
+-    const { fastembed } = await import('@mastra/fastembed');
+-    return fastembed.small.doEmbed(options);
++    if (process.env.MASTRACODE_EMBED_IN_PROCESS === '1') {
++      const { fastembed } = await import('@mastra/fastembed');
++      return fastembed.small.doEmbed(options);
++    }
++    return embedInSubprocess(options);
+   },
+ };
+ 

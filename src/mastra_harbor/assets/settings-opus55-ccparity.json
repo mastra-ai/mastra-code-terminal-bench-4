@@ -1,0 +1,12 @@
+{
+  "models": {
+    "omObservationThreshold": 120000,
+    "omReflectionThreshold": 40000,
+    "subagentModels": {
+      "default": "anthropic/claude-opus-5-5"
+    }
+  },
+  "preferences": {
+    "quietMode": true
+  }
+}

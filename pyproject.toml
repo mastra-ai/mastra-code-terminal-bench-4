@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=80"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mastra-harbor"
+version = "0.2.0"
+description = "Harbor adapter for the Mastra Code CLI"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+dependencies = ["harbor==0.23.0"]
+
+[project.optional-dependencies]
+test = ["pytest==8.4.2"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+mastra_harbor = ["assets/*.sh", "assets/*.json", "assets/*.mjs"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

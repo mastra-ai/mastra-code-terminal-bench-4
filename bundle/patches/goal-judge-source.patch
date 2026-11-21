@@ -1,0 +1,284 @@
+--- a/mastracode/sdk/src/agents/model.ts
++++ b/mastracode/sdk/src/agents/model.ts
+@@ -600,6 +600,17 @@
+ }
+ 
+ /**
++ * Goal judge model for headless runs when settings name none. Set by the headless
++ * CLI to the run's model so a headless goal judge needs no extra configuration.
++ */
++let headlessGoalJudgeModelId: string | undefined;
++
++/** Set, or clear with `undefined`, the headless default goal judge model. */
++export function setHeadlessGoalJudgeModel(modelId: string | undefined): void {
++  headlessGoalJudgeModelId = modelId || undefined;
++}
++
++/**
+  * Goal judge model resolver for the agent's `goal.judge` config. Resolves the
+  * configured goal judge model through mastracode's gateway so provider
+  * credentials (stored in auth storage, not just env) are injected — a bare model
+@@ -617,7 +628,7 @@
+   { requestContext }: { requestContext: RequestContext },
+   settingsPath?: string,
+ ): ResolvedModel | undefined {
+-  const judgeModelId = loadSettings(settingsPath).models.goalJudgeModel;
++  const judgeModelId = loadSettings(settingsPath).models.goalJudgeModel ?? headlessGoalJudgeModelId;
+   if (!judgeModelId) return undefined;
+   return resolveModel(judgeModelId, { remapForCodexOAuth: true, requestContext });
+ }
+--- a/mastracode/sdk/src/headless/types.ts
++++ b/mastracode/sdk/src/headless/types.ts
+@@ -94,12 +94,24 @@
+    * by default.
+    */
+   maxTurns?: number;
++  /**
++   * Judge a prompt run with the agent's goal judge. The prompt becomes the goal
++   * objective and is still sent as the user message; when the agent stops, the
++   * judge either accepts the result or sends the agent back to work, for at most
++   * `maxRuns` evaluations. Needs a resolvable goal judge model; best effort.
++   */
++  judge?: RunMCJudgeOptions;
+   /** How approvals / suspensions are resolved. Defaults to {@link autoApprovePolicy}. */
+   policy?: ResolutionPolicy;
+   /** External abort signal; aborting it aborts the run. */
+   signal?: AbortSignal;
+ }
+ 
++export interface RunMCJudgeOptions {
++  /** Judge evaluations allowed; the judge can send the agent back `maxRuns - 1` times. */
++  maxRuns: number;
++}
++
+ export interface RunMCGoalOptions {
+   objective: string;
+   judgeModelId: string;
+--- a/mastracode/sdk/src/headless/run-mc.ts
++++ b/mastracode/sdk/src/headless/run-mc.ts
+@@ -545,6 +545,18 @@
+         if (!settled) await session.sendSignal(createGoalReminderSignal(objective)).accepted;
+       } else {
+         if (!options.prompt) return fail('A prompt or goal is required.');
++        if (options.judge) {
++          // Best effort: if the objective can't be set, this stays a plain prompt run.
++          try {
++            const judgeGoalManager = new GoalManager();
++            const judgeState = { controller, session, goalManager: judgeGoalManager, pendingNewThread: false } as any;
++            if (await judgeGoalManager.setGoal(judgeState, options.prompt, '', options.judge.maxRuns)) {
++              await judgeGoalManager.saveToThread(judgeState);
++            }
++          } catch {
++            // fall through to a plain prompt run
++          }
++        }
+         await session.sendMessage({ content: options.prompt });
+       }
+     } catch (err) {
+--- a/mastracode/sdk/src/headless/cli.ts
++++ b/mastracode/sdk/src/headless/cli.ts
+@@ -10,6 +10,7 @@
+ import type { Writable } from 'node:stream';
+ import { parseArgs } from 'node:util';
+ 
++import { setHeadlessGoalJudgeModel } from '../agents/model.js';
+ import { resolveSubagentsSetting } from '../agents/subagents/index.js';
+ import { createMastraCode } from '../index.js';
+ import { activateModePackInSettings, resolveModePackArg, resolvePackSelection } from '../onboarding/pack-activation.js';
+@@ -55,6 +56,8 @@
+ 
+ const parseArgsOptions = buildParseArgsOptions();
+ const STOP_NOTIFICATION_DISPATCH_TIMEOUT_MS = 2_000;
++/** Judge evaluations per headless run: the judge can send the agent back at most twice. */
++const HEADLESS_GOAL_JUDGE_MAX_RUNS = 3;
+ 
+ /**
+  * Returns true if `argv` selects headless mode. This must agree with what
+@@ -252,6 +255,11 @@
+     const { controller, session, mcpManager } = boot;
+ 
+     const effectiveDefaults = resolveModelDefaults(settings, listBuiltinModePacks());
++    // Headless runs are judged against the prompt by the goal judge, which defaults to the run's model.
++    // MASTRACODE_HEADLESS_GOAL_JUDGE=0 turns this off.
++    const headlessJudgeModelId =
++      process.env.MASTRACODE_HEADLESS_GOAL_JUDGE === '0' ? undefined : (settings.models.goalJudgeModel ?? args.model);
++    if (headlessJudgeModelId && !settings.models.goalJudgeModel) setHeadlessGoalJudgeModel(headlessJudgeModelId);
+ 
+     if (mcpManager?.hasServers()) {
+       try {
+@@ -289,6 +297,7 @@
+       title: args.title,
+       timeoutMs: args.timeout ? args.timeout * 1000 : undefined,
+       maxTurns: args.maxTurns,
++      ...(headlessJudgeModelId ? { judge: { maxRuns: HEADLESS_GOAL_JUDGE_MAX_RUNS } } : {}),
+       policy: args.permissionMode ? permissionModeToPolicy(args.permissionMode) : undefined,
+     });
+ 
+--- a/mastracode/sdk/src/headless/run-mc.judge.test.ts
++++ b/mastracode/sdk/src/headless/run-mc.judge.test.ts
+@@ -0,0 +1,106 @@
++/**
++ * `runMC` with `judge`: the prompt becomes the goal objective before it is sent,
++ * and it is still sent as the user message (not as a goal signal).
++ */
++import type { AgentControllerEvent } from '@mastra/core/agent-controller';
++import { beforeEach, describe, expect, it, vi } from 'vitest';
++
++import { runMC } from './run-mc.js';
++import type { RunMCOptions } from './types.js';
++
++const h = vi.hoisted(() => {
++  const calls: string[] = [];
++  const setGoal = vi.fn(async (_state: unknown, objective: string, judgeModelId: string, maxRuns: number) => {
++    calls.push(`setGoal:${objective}:${judgeModelId}:${maxRuns}`);
++    return { id: 'goal-1', objective };
++  });
++  const saveToThread = vi.fn(async () => {
++    calls.push('saveToThread');
++  });
++  const GoalManager = vi.fn(function GoalManager() {
++    return { setGoal, saveToThread };
++  });
++  return { calls, setGoal, saveToThread, GoalManager };
++});
++
++vi.mock('@mastra/core/agent-controller', () => ({ isSessionStartupCancelledError: () => false }));
++vi.mock('../auth/account-rotation-processor.js', () => ({ MODEL_FALLBACK_STATE_KEY: 'modelFallback' }));
++vi.mock('../goal-manager.js', () => ({ GoalManager: h.GoalManager }));
++vi.mock('../goal-signal.js', () => ({ createGoalReminderSignal: vi.fn() }));
++vi.mock('../onboarding/settings.js', () => ({ THREAD_ACTIVE_MODEL_PACK_ID_KEY: 'activeModelPackId' }));
++
++function createFakeSession() {
++  let listener: ((event: AgentControllerEvent) => void) | undefined;
++  const emit = (event: Record<string, unknown>) => listener?.(event as AgentControllerEvent);
++  return {
++    identity: { getResourceId: () => undefined },
++    thread: { getId: () => 'thread-1', create: async () => {}, getById: async () => ({ id: 'thread-1' }) },
++    subscribe(fn: (event: AgentControllerEvent) => void) {
++      listener = fn;
++      return () => {};
++    },
++    abort: vi.fn(),
++    async sendMessage({ content }: { content: string }) {
++      h.calls.push(`sendMessage:${content}`);
++      emit({ type: 'agent_start' });
++      emit({ type: 'agent_end', reason: 'complete' });
++    },
++    sendSignal: vi.fn(() => {
++      h.calls.push('sendSignal');
++      return { accepted: Promise.resolve() };
++    }),
++  };
++}
++
++function run(options: Partial<RunMCOptions> = {}) {
++  return runMC({
++    controller: {} as RunMCOptions['controller'],
++    session: createFakeSession() as unknown as RunMCOptions['session'],
++    prompt: 'fix the bug',
++    timeoutMs: 5_000,
++    ...options,
++  } as RunMCOptions);
++}
++
++describe('runMC judge option', () => {
++  beforeEach(() => {
++    h.calls.length = 0;
++    vi.clearAllMocks();
++  });
++
++  it('sets the prompt as the objective, then sends the prompt as the user message', async () => {
++    const result = await run({ judge: { maxRuns: 3 } }).result;
++
++    expect(result.status).toBe('completed');
++    expect(h.GoalManager).toHaveBeenCalledTimes(1);
++    expect(h.calls).toEqual(['setGoal:fix the bug::3', 'saveToThread', 'sendMessage:fix the bug']);
++  });
++
++  it('does not construct a goal manager without the option', async () => {
++    const result = await run().result;
++
++    expect(result.status).toBe('completed');
++    expect(h.GoalManager).not.toHaveBeenCalled();
++    expect(h.calls).toEqual(['sendMessage:fix the bug']);
++  });
++
++  it('still sends the prompt when setting the objective throws', async () => {
++    h.setGoal.mockRejectedValueOnce(new Error('storage down'));
++
++    const result = await run({ judge: { maxRuns: 3 } }).result;
++
++    expect(result.status).toBe('completed');
++    expect(h.saveToThread).not.toHaveBeenCalled();
++    expect(h.calls).toEqual(['sendMessage:fix the bug']);
++  });
++
++  it('skips the save when no objective was set', async () => {
++    h.setGoal.mockResolvedValueOnce(null as never);
++
++    const result = await run({ judge: { maxRuns: 2 } }).result;
++
++    expect(result.status).toBe('completed');
++    expect(h.saveToThread).not.toHaveBeenCalled();
++    expect(h.calls).toEqual(['sendMessage:fix the bug']);
++  });
++});
+--- a/mastracode/sdk/src/agents/model.goal-judge.test.ts
++++ b/mastracode/sdk/src/agents/model.goal-judge.test.ts
+@@ -0,0 +1,56 @@
++const { appDataDir, previousAppDataDir } = vi.hoisted(() => {
++  const dir = `${process.env.TMPDIR ?? '/tmp'}/mastracode-goal-judge-${process.pid}`;
++  const previous = process.env.MASTRA_APP_DATA_DIR;
++  process.env.MASTRA_APP_DATA_DIR = dir;
++  return { appDataDir: dir, previousAppDataDir: previous };
++});
++
++import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
++import { join } from 'node:path';
++import { RequestContext } from '@mastra/core/request-context';
++import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
++
++import { getGoalJudgeModel, setHeadlessGoalJudgeModel } from './model.js';
++
++const missingSettings = join(appDataDir, 'missing-settings.json');
++const ctx = () => ({ requestContext: new RequestContext() });
++const idOf = (m: unknown) => String((m as { modelId?: string } | undefined)?.modelId ?? '');
++
++afterEach(() => {
++  setHeadlessGoalJudgeModel(undefined);
++});
++
++afterAll(() => {
++  if (previousAppDataDir === undefined) delete process.env.MASTRA_APP_DATA_DIR;
++  else process.env.MASTRA_APP_DATA_DIR = previousAppDataDir;
++  rmSync(appDataDir, { recursive: true, force: true });
++});
++
++describe('getGoalJudgeModel headless default', () => {
++  it('returns undefined when neither settings nor the headless default name a judge', () => {
++    expect(getGoalJudgeModel(ctx(), missingSettings)).toBeUndefined();
++  });
++
++  it('falls back to the headless default when settings name no judge', () => {
++    setHeadlessGoalJudgeModel('anthropic/claude-opus-5-5');
++    const model = getGoalJudgeModel(ctx(), missingSettings);
++    expect(model).toBeDefined();
++    expect(idOf(model)).toContain('claude-opus-5-5');
++  });
++
++  it('clears the headless default with undefined or an empty id', () => {
++    setHeadlessGoalJudgeModel('anthropic/claude-opus-5-5');
++    setHeadlessGoalJudgeModel('');
++    expect(getGoalJudgeModel(ctx(), missingSettings)).toBeUndefined();
++  });
++
++  it('prefers the judge named in settings', () => {
++    mkdirSync(appDataDir, { recursive: true });
++    const settingsPath = join(appDataDir, 'settings-judge.json');
++    writeFileSync(settingsPath, JSON.stringify({ models: { goalJudgeModel: 'anthropic/claude-haiku-4-5' } }));
++    setHeadlessGoalJudgeModel('anthropic/claude-opus-5-5');
++    const model = getGoalJudgeModel(ctx(), settingsPath);
++    expect(idOf(model)).toContain('claude-haiku-4-5');
++    expect(idOf(model)).not.toContain('opus');
++  });
++});

@@ -1,0 +1,9 @@
+{
+  "models": {
+    "omObservationThreshold": 120000,
+    "omReflectionThreshold": 40000
+  },
+  "preferences": {
+    "quietMode": true
+  }
+}
